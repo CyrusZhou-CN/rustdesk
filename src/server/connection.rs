@@ -235,7 +235,7 @@ pub struct Connection {
     auto_disconnect_timer: Option<(Instant, u64)>,
     authed_conn_id: Option<self::raii::AuthedConnID>,
     file_remove_log_control: FileRemoveLogControl,
-    #[cfg(feature = "gpucodec")]
+    #[cfg(feature = "vram")]
     supported_encoding_flag: (bool, Option<bool>),
     services_subed: bool,
     delayed_read_dir: Option<(String, bool)>,
@@ -386,7 +386,7 @@ impl Connection {
             auto_disconnect_timer: None,
             authed_conn_id: None,
             file_remove_log_control: FileRemoveLogControl::new(id),
-            #[cfg(feature = "gpucodec")]
+            #[cfg(feature = "vram")]
             supported_encoding_flag: (false, None),
             services_subed: false,
             delayed_read_dir: None,
@@ -691,7 +691,7 @@ impl Connection {
                         }
                     }
                     conn.file_remove_log_control.on_timer().drain(..).map(|x| conn.send_to_cm(x)).count();
-                    #[cfg(feature = "gpucodec")]
+                    #[cfg(feature = "vram")]
                     conn.update_supported_encoding();
                 }
                 _ = test_delay_timer.tick() => {
@@ -956,6 +956,13 @@ impl Connection {
         if !self.check_whitelist(&addr).await {
             return false;
         }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if crate::is_server() && Config::get_option("allow-only-conn-window-open") == "Y" {
+            if !crate::check_process("", !crate::platform::is_root()) {
+                self.send_login_error("The main window is not open").await;
+                return false;
+            }
+        }
         self.ip = addr.ip().to_string();
         let mut msg_out = Message::new();
         msg_out.set_hash(self.hash.clone());
@@ -1126,10 +1133,7 @@ impl Connection {
             );
             #[cfg(feature = "virtual_display_driver")]
             if crate::platform::is_installed() {
-                let virtual_displays = virtual_display_manager::get_virtual_displays();
-                if !virtual_displays.is_empty() {
-                    platform_additions.insert("virtual_displays".into(), json!(&virtual_displays));
-                }
+                platform_additions.extend(virtual_display_manager::get_platform_additions());
             }
             platform_additions.insert(
                 "supported_privacy_mode_impl".into(),
@@ -2588,8 +2592,7 @@ impl Connection {
                 self.send(make_msg("idd_not_support_under_win10_2004_tip".to_string()))
                     .await;
             } else {
-                if let Err(e) =
-                    virtual_display_manager::plug_in_index_modes(t.display as _, Vec::new())
+                if let Err(e) = virtual_display_manager::plug_in_monitor(t.display as _, Vec::new())
                 {
                     log::error!("Failed to plug in virtual display: {}", e);
                     self.send(make_msg(format!(
@@ -2600,13 +2603,8 @@ impl Connection {
                 }
             }
         } else {
-            let indices = if t.display == -1 {
-                virtual_display_manager::get_virtual_displays()
-            } else {
-                vec![t.display as _]
-            };
-            if let Err(e) = virtual_display_manager::plug_out_peer_request(&indices) {
-                log::error!("Failed to plug out virtual display {:?}: {}", &indices, e);
+            if let Err(e) = virtual_display_manager::plug_out_monitor(t.display) {
+                log::error!("Failed to plug out virtual display {}: {}", t.display, e);
                 self.send(make_msg(format!(
                     "Failed to plug out virtual displays: {}",
                     e
@@ -2632,7 +2630,7 @@ impl Connection {
                     let name = display.name();
                     #[cfg(all(windows, feature = "virtual_display_driver"))]
                     if let Some(_ok) =
-                        virtual_display_manager::change_resolution_if_is_virtual_display(
+                        virtual_display_manager::rustdesk_idd::change_resolution_if_is_virtual_display(
                             &name,
                             r.width as _,
                             r.height as _,
@@ -2851,7 +2849,6 @@ impl Connection {
         } else {
             let is_pre_privacy_on = privacy_mode::is_in_privacy_mode();
             let pre_impl_key = privacy_mode::get_cur_impl_key();
-            let turn_on_res = privacy_mode::turn_on_privacy(&impl_key, self.inner.id);
 
             if is_pre_privacy_on {
                 if let Some(pre_impl_key) = pre_impl_key {
@@ -2865,6 +2862,7 @@ impl Connection {
                 }
             }
 
+            let turn_on_res = privacy_mode::turn_on_privacy(&impl_key, self.inner.id).await;
             match turn_on_res {
                 Some(Ok(res)) => {
                     if res {
@@ -2899,7 +2897,7 @@ impl Connection {
                 }
                 Some(Err(e)) => {
                     log::error!("Failed to turn on privacy mode. {}", e);
-                    if !privacy_mode::is_in_privacy_mode() {
+                    if privacy_mode::is_in_privacy_mode() {
                         let _ = Self::turn_off_privacy_to_msg(
                             privacy_mode::INVALID_PRIVACY_MODE_CONN_ID,
                         );
@@ -3090,9 +3088,9 @@ impl Connection {
             .map(|t| t.0 = Instant::now());
     }
 
-    #[cfg(feature = "gpucodec")]
+    #[cfg(feature = "vram")]
     fn update_supported_encoding(&mut self) {
-        let not_use = Some(scrap::gpucodec::GpuEncoder::not_use());
+        let not_use = Some(scrap::vram::VRamEncoder::not_use());
         if !self.authorized
             || self.supported_encoding_flag.0 && self.supported_encoding_flag.1 == not_use
         {
