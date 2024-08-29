@@ -1,37 +1,13 @@
 use hbb_common::{bail, platform::windows::is_windows_version_or_greater, ResultType};
-use std::sync::atomic;
 
 // This string is defined here.
-//  https://github.com/fufesou/RustDeskIddDriver/blob/b370aad3f50028b039aad211df60c8051c4a64d6/RustDeskIddDriver/RustDeskIddDriver.inf#LL73C1-L73C40
+//  https://github.com/rustdesk-org/RustDeskIddDriver/blob/b370aad3f50028b039aad211df60c8051c4a64d6/RustDeskIddDriver/RustDeskIddDriver.inf#LL73C1-L73C40
 pub const RUSTDESK_IDD_DEVICE_STRING: &'static str = "RustDeskIddDriver Device\0";
 pub const AMYUNI_IDD_DEVICE_STRING: &'static str = "USB Mobile Monitor Virtual Display\0";
 
 const IDD_IMPL: &str = IDD_IMPL_AMYUNI;
 const IDD_IMPL_RUSTDESK: &str = "rustdesk_idd";
 const IDD_IMPL_AMYUNI: &str = "amyuni_idd";
-
-const IS_CAN_PLUG_OUT_ALL_NOT_SET: i8 = 0;
-const IS_CAN_PLUG_OUT_ALL_YES: i8 = 1;
-const IS_CAN_PLUG_OUT_ALL_NO: i8 = 2;
-static IS_CAN_PLUG_OUT_ALL: atomic::AtomicI8 = atomic::AtomicI8::new(IS_CAN_PLUG_OUT_ALL_NOT_SET);
-
-pub fn is_can_plug_out_all() -> bool {
-    IS_CAN_PLUG_OUT_ALL.load(atomic::Ordering::Relaxed) != IS_CAN_PLUG_OUT_ALL_NO
-}
-
-// No need to consider concurrency here.
-pub fn set_can_plug_out_all(v: bool) {
-    if IS_CAN_PLUG_OUT_ALL.load(atomic::Ordering::Relaxed) == IS_CAN_PLUG_OUT_ALL_NOT_SET {
-        IS_CAN_PLUG_OUT_ALL.store(
-            if v {
-                IS_CAN_PLUG_OUT_ALL_YES
-            } else {
-                IS_CAN_PLUG_OUT_ALL_NO
-            },
-            atomic::Ordering::Relaxed,
-        );
-    }
-}
 
 pub fn is_amyuni_idd() -> bool {
     IDD_IMPL == IDD_IMPL_AMYUNI
@@ -100,7 +76,7 @@ pub fn plug_in_monitor(idx: u32, modes: Vec<virtual_display::MonitorMode>) -> Re
     }
 }
 
-pub fn plug_out_monitor(index: i32) -> ResultType<()> {
+pub fn plug_out_monitor(index: i32, force_all: bool) -> ResultType<()> {
     match IDD_IMPL {
         IDD_IMPL_RUSTDESK => {
             let indices = if index == -1 {
@@ -110,7 +86,7 @@ pub fn plug_out_monitor(index: i32) -> ResultType<()> {
             };
             rustdesk_idd::plug_out_peer_request(&indices)
         }
-        IDD_IMPL_AMYUNI => amyuni_idd::plug_out_monitor(index),
+        IDD_IMPL_AMYUNI => amyuni_idd::plug_out_monitor(index, force_all),
         _ => bail!("Unsupported virtual display implementation."),
     }
 }
@@ -126,12 +102,12 @@ pub fn plug_in_peer_request(modes: Vec<Vec<virtual_display::MonitorMode>>) -> Re
     }
 }
 
-pub fn plug_out_monitor_indices(indices: &[u32]) -> ResultType<()> {
+pub fn plug_out_monitor_indices(indices: &[u32], force_all: bool) -> ResultType<()> {
     match IDD_IMPL {
         IDD_IMPL_RUSTDESK => rustdesk_idd::plug_out_peer_request(indices),
         IDD_IMPL_AMYUNI => {
             for _idx in indices.iter() {
-                amyuni_idd::plug_out_monitor(0)?;
+                amyuni_idd::plug_out_monitor(0, force_all)?;
             }
             Ok(())
         }
@@ -142,7 +118,7 @@ pub fn plug_out_monitor_indices(indices: &[u32]) -> ResultType<()> {
 pub fn reset_all() -> ResultType<()> {
     match IDD_IMPL {
         IDD_IMPL_RUSTDESK => rustdesk_idd::reset_all(),
-        IDD_IMPL_AMYUNI => crate::privacy_mode::turn_off_privacy(0, None).unwrap_or(Ok(())),
+        IDD_IMPL_AMYUNI => amyuni_idd::reset_all(),
         _ => bail!("Unsupported virtual display implementation."),
     }
 }
@@ -402,88 +378,231 @@ pub mod rustdesk_idd {
 
 pub mod amyuni_idd {
     use super::windows;
-    use crate::platform::windows::get_amyuni_exe_name;
-    use hbb_common::{bail, lazy_static, log, ResultType};
+    use crate::platform::{reg_display_settings, win_device};
+    use hbb_common::{bail, lazy_static, log, tokio::time::Instant, ResultType};
     use std::{
         ptr::null_mut,
         sync::{Arc, Mutex},
+        time::Duration,
     };
-    use winapi::um::shellapi::ShellExecuteA;
+    use winapi::{
+        shared::{guiddef::GUID, winerror::ERROR_NO_MORE_ITEMS},
+        um::shellapi::ShellExecuteA,
+    };
+
+    const INF_PATH: &str = r#"usbmmidd_v2\usbmmIdd.inf"#;
+    const INTERFACE_GUID: GUID = GUID {
+        Data1: 0xb5ffd75f,
+        Data2: 0xda40,
+        Data3: 0x4353,
+        Data4: [0x8f, 0xf8, 0xb6, 0xda, 0xf6, 0xf1, 0xd8, 0xca],
+    };
+    const HARDWARE_ID: &str = "usbmmidd";
+    const PLUG_MONITOR_IO_CONTROL_CDOE: u32 = 2307084;
+    const INSTALLER_EXE_FILE: &str = "deviceinstaller64.exe";
 
     lazy_static::lazy_static! {
         static ref LOCK: Arc<Mutex<()>> = Default::default();
+        static ref LAST_PLUG_IN_HEADLESS_TIME: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
     }
 
-    fn run_deviceinstaller(args: &str) -> ResultType<()> {
-        let Some(exe_name) = get_amyuni_exe_name() else {
-            bail!("Cannot get amyuni exe name.")
-        };
-
+    fn get_deviceinstaller64_work_dir() -> ResultType<Option<Vec<u8>>> {
         let cur_exe = std::env::current_exe()?;
         let Some(cur_dir) = cur_exe.parent() else {
             bail!("Cannot get parent of current exe file.");
         };
-
         let work_dir = cur_dir.join("usbmmidd_v2");
         if !work_dir.exists() {
-            bail!("usbmmidd_v2 does not exist.",);
+            return Ok(None);
         }
+        let exe_path = work_dir.join(INSTALLER_EXE_FILE);
+        if !exe_path.exists() {
+            return Ok(None);
+        }
+
         let Some(work_dir) = work_dir.to_str() else {
             bail!("Cannot convert work_dir to string.");
         };
         let mut work_dir2 = work_dir.as_bytes().to_vec();
         work_dir2.push(0);
-
-        unsafe {
-            const SW_HIDE: i32 = 0;
-            let mut args = args.bytes().collect::<Vec<_>>();
-            args.push(0);
-            let mut exe_name = exe_name.bytes().collect::<Vec<_>>();
-            exe_name.push(0);
-            let hi = ShellExecuteA(
-                null_mut(),
-                "open\0".as_ptr() as _,
-                exe_name.as_ptr() as _,
-                args.as_ptr() as _,
-                work_dir2.as_ptr() as _,
-                SW_HIDE,
-            ) as i32;
-            if hi <= 32 {
-                log::error!("Failed to run deviceinstaller: {}", hi);
-                bail!("Failed to run deviceinstaller.")
-            }
-            Ok(())
-        }
+        Ok(Some(work_dir2))
     }
 
-    fn check_install_driver() -> ResultType<()> {
+    pub fn uninstall_driver() -> ResultType<()> {
+        if let Ok(Some(work_dir)) = get_deviceinstaller64_work_dir() {
+            if crate::platform::windows::is_x64() {
+                log::info!("Uninstalling driver by deviceinstaller64.exe");
+                install_if_x86_on_x64(&work_dir, "remove usbmmidd")?;
+                return Ok(());
+            }
+        }
+
+        log::info!("Uninstalling driver by SetupAPI");
+        let mut reboot_required = false;
+        let _ = unsafe { win_device::uninstall_driver(HARDWARE_ID, &mut reboot_required)? };
+        Ok(())
+    }
+
+    // SetupDiCallClassInstaller() will always fail if current_exe() is built as x86 and running on x64.
+    // So we need to call another x64 version exe to install and uninstall the driver.
+    fn install_if_x86_on_x64(work_dir: &[u8], args: &str) -> ResultType<()> {
+        const SW_HIDE: i32 = 0;
+        let mut args = args.bytes().collect::<Vec<_>>();
+        args.push(0);
+        let mut exe_file = INSTALLER_EXE_FILE.bytes().collect::<Vec<_>>();
+        exe_file.push(0);
+        let hi = unsafe {
+            ShellExecuteA(
+                null_mut(),
+                "open\0".as_ptr() as _,
+                exe_file.as_ptr() as _,
+                args.as_ptr() as _,
+                work_dir.as_ptr() as _,
+                SW_HIDE,
+            ) as i32
+        };
+        if hi <= 32 {
+            log::error!("Failed to run deviceinstaller: {}", hi);
+            bail!("Failed to run deviceinstaller.")
+        }
+        Ok(())
+    }
+
+    // If the driver is installed by "deviceinstaller64.exe", the driver will be installed asynchronously.
+    // The caller must wait some time before using the driver.
+    fn check_install_driver(is_async: &mut bool) -> ResultType<()> {
         let _l = LOCK.lock().unwrap();
         let drivers = windows::get_display_drivers();
         if drivers
             .iter()
             .any(|(s, c)| s == super::AMYUNI_IDD_DEVICE_STRING && *c == 0)
         {
+            *is_async = false;
             return Ok(());
         }
 
-        run_deviceinstaller("install usbmmidd.inf usbmmidd")
+        if let Ok(Some(work_dir)) = get_deviceinstaller64_work_dir() {
+            if crate::platform::windows::is_x64() {
+                log::info!("Installing driver by deviceinstaller64.exe");
+                install_if_x86_on_x64(&work_dir, "install usbmmidd.inf usbmmidd")?;
+                *is_async = true;
+                return Ok(());
+            }
+        }
+
+        let exe_file = std::env::current_exe()?;
+        let Some(cur_dir) = exe_file.parent() else {
+            bail!("Cannot get parent of current exe file");
+        };
+        let inf_path = cur_dir.join(INF_PATH);
+        if !inf_path.exists() {
+            bail!("Driver inf file not found.");
+        }
+        let inf_path = inf_path.to_string_lossy().to_string();
+
+        log::info!("Installing driver by SetupAPI");
+        let mut reboot_required = false;
+        let _ =
+            unsafe { win_device::install_driver(&inf_path, HARDWARE_ID, &mut reboot_required)? };
+        *is_async = false;
+        Ok(())
+    }
+
+    pub fn reset_all() -> ResultType<()> {
+        let _ = crate::privacy_mode::turn_off_privacy(0, None);
+        let _ = plug_out_monitor(-1, true);
+        *LAST_PLUG_IN_HEADLESS_TIME.lock().unwrap() = None;
+        Ok(())
+    }
+
+    #[inline]
+    fn plug_monitor_(add: bool) -> Result<(), win_device::DeviceError> {
+        let cmd = if add { 0x10 } else { 0x00 };
+        let cmd = [cmd, 0x00, 0x00, 0x00];
+        unsafe {
+            win_device::device_io_control(&INTERFACE_GUID, PLUG_MONITOR_IO_CONTROL_CDOE, &cmd, 0)?;
+        }
+        Ok(())
+    }
+
+    // `std::thread::sleep()` with a timeout is acceptable here.
+    // Because user can wait for a while to plug in a monitor.
+    fn plug_in_monitor_(add: bool, is_driver_async_installed: bool) -> ResultType<()> {
+        let timeout = Duration::from_secs(3);
+        let now = Instant::now();
+        let reg_connectivity_old = reg_display_settings::read_reg_connectivity();
+        loop {
+            match plug_monitor_(add) {
+                Ok(_) => {
+                    break;
+                }
+                Err(e) => {
+                    if is_driver_async_installed {
+                        if let win_device::DeviceError::WinApiLastErr(_, e2) = &e {
+                            if e2.raw_os_error() == Some(ERROR_NO_MORE_ITEMS as _) {
+                                if now.elapsed() < timeout {
+                                    std::thread::sleep(Duration::from_millis(100));
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    return Err(e.into());
+                }
+            }
+        }
+        // Workaround for the issue that we can't set the default the resolution.
+        if let Ok(old_connectivity_old) = reg_connectivity_old {
+            std::thread::spawn(move || {
+                try_reset_resolution_on_first_plug_in(old_connectivity_old.len(), 1920, 1080);
+            });
+        }
+
+        Ok(())
+    }
+
+    fn try_reset_resolution_on_first_plug_in(
+        old_connectivity_len: usize,
+        width: usize,
+        height: usize,
+    ) {
+        for _ in 0..10 {
+            std::thread::sleep(Duration::from_millis(300));
+            if let Ok(reg_connectivity_new) = reg_display_settings::read_reg_connectivity() {
+                if reg_connectivity_new.len() != old_connectivity_len {
+                    for name in
+                        windows::get_device_names(Some(super::AMYUNI_IDD_DEVICE_STRING)).iter()
+                    {
+                        crate::platform::change_resolution(&name, width, height).ok();
+                    }
+                    break;
+                }
+            }
+        }
     }
 
     pub fn plug_in_headless() -> ResultType<()> {
-        if get_monitor_count() > 0 {
-            return Ok(());
+        let mut tm = LAST_PLUG_IN_HEADLESS_TIME.lock().unwrap();
+        if let Some(tm) = &mut *tm {
+            if tm.elapsed() < Duration::from_secs(3) {
+                bail!("Plugging in too frequently.");
+            }
         }
+        *tm = Some(Instant::now());
+        drop(tm);
 
-        if let Err(e) = check_install_driver() {
+        let mut is_async = false;
+        if let Err(e) = check_install_driver(&mut is_async) {
             log::error!("Failed to install driver: {}", e);
             bail!("Failed to install driver.");
         }
 
-        run_deviceinstaller("enableidd 1")
+        plug_in_monitor_(true, is_async)
     }
 
     pub fn plug_in_monitor() -> ResultType<()> {
-        if let Err(e) = check_install_driver() {
+        let mut is_async = false;
+        if let Err(e) = check_install_driver(&mut is_async) {
             log::error!("Failed to install driver: {}", e);
             bail!("Failed to install driver.");
         }
@@ -492,10 +611,10 @@ pub mod amyuni_idd {
             bail!("There are already 4 monitors plugged in.");
         }
 
-        run_deviceinstaller("enableidd 1")
+        plug_in_monitor_(true, is_async)
     }
 
-    pub fn plug_out_monitor(index: i32) -> ResultType<()> {
+    pub fn plug_out_monitor(index: i32, force_all: bool) -> ResultType<()> {
         let all_count = windows::get_device_names(None).len();
         let amyuni_count = get_monitor_count();
         let mut to_plug_out_count = match all_count {
@@ -504,7 +623,7 @@ pub mod amyuni_idd {
                 if amyuni_count == 0 {
                     bail!("No virtual displays to plug out.")
                 } else {
-                    if super::is_can_plug_out_all() {
+                    if force_all {
                         1
                     } else {
                         bail!("This only virtual display cannot be pulled out.")
@@ -513,7 +632,7 @@ pub mod amyuni_idd {
             }
             _ => {
                 if all_count == amyuni_count {
-                    if super::is_can_plug_out_all() {
+                    if force_all {
                         all_count
                     } else {
                         all_count - 1
@@ -527,7 +646,7 @@ pub mod amyuni_idd {
             to_plug_out_count = 1;
         }
         for _i in 0..to_plug_out_count {
-            let _ = run_deviceinstaller(&format!("enableidd 0"));
+            let _ = plug_monitor_(false);
         }
         Ok(())
     }
@@ -535,6 +654,13 @@ pub mod amyuni_idd {
     #[inline]
     pub fn get_monitor_count() -> usize {
         windows::get_device_names(Some(super::AMYUNI_IDD_DEVICE_STRING)).len()
+    }
+
+    #[inline]
+    pub fn is_my_display(name: &str) -> bool {
+        windows::get_device_names(Some(super::AMYUNI_IDD_DEVICE_STRING))
+            .iter()
+            .any(|s| windows::is_device_name(s, name))
     }
 }
 
