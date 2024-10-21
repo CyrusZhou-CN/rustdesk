@@ -61,7 +61,6 @@ fn initialize(app_dir: &str, custom_client_config: &str) {
         scrap::mediacodec::check_mediacodec();
         crate::common::test_rendezvous_server();
         crate::common::test_nat_type();
-        crate::common::check_software_update();
     }
     #[cfg(target_os = "ios")]
     {
@@ -242,21 +241,17 @@ pub fn session_is_multi_ui_session(session_id: SessionID) -> SyncReturn<bool> {
     }
 }
 
-pub fn session_record_screen(
-    session_id: SessionID,
-    start: bool,
-    display: usize,
-    width: usize,
-    height: usize,
-) {
+pub fn session_record_screen(session_id: SessionID, start: bool) {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
-        session.record_screen(start, display as _, width as _, height as _);
+        session.record_screen(start);
     }
 }
 
-pub fn session_record_status(session_id: SessionID, status: bool) {
+pub fn session_get_is_recording(session_id: SessionID) -> SyncReturn<bool> {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
-        session.record_status(status);
+        SyncReturn(session.is_recording())
+    } else {
+        SyncReturn(false)
     }
 }
 
@@ -603,6 +598,7 @@ pub fn session_send_files(
     file_num: i32,
     include_hidden: bool,
     is_remote: bool,
+    _is_dir: bool,
 ) {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
         session.send_files(act_id, path, to, file_num, include_hidden, is_remote);
@@ -634,7 +630,7 @@ pub fn session_remove_file(
     }
 }
 
-pub fn session_read_dir_recursive(
+pub fn session_read_dir_to_remove_recursive(
     session_id: SessionID,
     act_id: i32,
     path: String,
@@ -1376,11 +1372,10 @@ pub fn main_get_last_remote_id() -> String {
     LocalConfig::get_remote_id()
 }
 
-pub fn main_get_software_update_url() -> String {
+pub fn main_get_software_update_url() {
     if get_local_option("enable-check-update".to_string()) != "N" {
         crate::common::check_software_update();
     }
-    crate::common::SOFTWARE_UPDATE_URL.lock().unwrap().clone()
 }
 
 pub fn main_get_home_dir() -> String {
